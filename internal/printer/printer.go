@@ -685,13 +685,35 @@ func sendBluetooth(ctx context.Context, info Info, payload []byte) error {
 }
 
 // sendSpooler mengirim payload ke spooler OS dalam mode RAW.
-//   - Windows: tulis payload ke file sementara lalu pakai PowerShell
-//     untuk Out-Printer; alternatifnya, salin ke share \\localhost\printer.
-//     Implementasi di sini menggunakan pendekatan paling kompatibel:
-//     menulis stream RAW melalui PowerShell + .NET PrintDocument tidak
-//     trivial, jadi kita pakai utilitas `print /D:` dengan file temp.
-//   - Linux/macOS: pakai `lp -d <printer> -o raw <tempfile>`.
+//
+// Windows: panggil WinSpool API langsung (OpenPrinterW + StartDocPrinter +
+// WritePrinter + EndDocPrinter) via package golang.org/x/sys/windows.
+// Pendekatan ini menghindari startup PowerShell dan Add-Type (.NET C#)
+// yang sebelumnya memakan ratusan ms s/d >1 detik per cetak. Payload
+// dikirim langsung dari memory tanpa file sementara.
+//
+// Jika WinSpool gagal (mis. printer virtual yang menolak datatype RAW,
+// permission khusus, dll.) disediakan fallback klasik: tulis payload
+// ke file temp lalu jalankan `print /D:` dan terakhir `copy /B` ke
+// share UNC printer.
+//
+// Linux/macOS: tetap memakai `lp -d <printer> -o raw <tempfile>`.
 func sendSpooler(ctx context.Context, info Info, payload []byte) error {
+	if runtime.GOOS == "windows" {
+		// Jalur cepat: WinSpool langsung tanpa file temp. Sukses di sini
+		// akan menjadi kasus mayoritas dan menghilangkan overhead proses
+		// eksternal sepenuhnya.
+		if err := sendWinspoolRaw(ctx, info.Name, payload); err == nil {
+			return nil
+		} else {
+			// Fallback: tulis ke file temp lalu coba `print /D:` dan
+			// `copy /B` seperti jalur lama. File temp hanya dibuat
+			// di jalur fallback agar jalur cepat tetap bebas I/O disk.
+			return spoolWindowsFallback(ctx, info.Name, payload, err)
+		}
+	}
+
+	// Non-Windows: masih butuh file temp untuk lp/lpr.
 	tmp, err := os.CreateTemp("", "printbridge-*.bin")
 	if err != nil {
 		return fmt.Errorf("gagal membuat file temp: %w", err)
@@ -709,8 +731,6 @@ func sendSpooler(ctx context.Context, info Info, payload []byte) error {
 	defer os.Remove(tmpPath)
 
 	switch runtime.GOOS {
-	case "windows":
-		return spoolWindows(ctx, info.Name, tmpPath, payload)
 	case "linux", "darwin":
 		return spoolUnix(ctx, info.Name, tmpPath)
 	default:
@@ -718,93 +738,40 @@ func sendSpooler(ctx context.Context, info Info, payload []byte) error {
 	}
 }
 
-// spoolWindows mengirim file RAW ke printer Windows menggunakan
-// PowerShell + .NET RawPrinterHelper via Out-Printer. Bila gagal,
-// fallback ke perintah "print /D:".
-func spoolWindows(ctx context.Context, printerName, filePath string, payload []byte) error {
-	// Strategi 1: copy /b file ke share UNC printer.
-	// `cmd /c copy /B "filePath" "\\localhost\printerName"` hanya bekerja
-	// bila printer di-share. Karena belum tentu, kita pakai PowerShell.
-	psScript := buildPowerShellRawPrintScript(printerName, filePath)
-	if out, err := runCommand(ctx, 15*time.Second, "powershell", "-NoProfile", "-NonInteractive", "-Command", psScript); err == nil {
-		_ = out
+// spoolWindowsFallback dipanggil hanya bila jalur cepat WinSpool gagal.
+// Fungsi ini menulis payload ke file sementara lalu mencoba dua strategi
+// legacy secara berurutan: `print /D:` dan `copy /B` ke share UNC
+// printer. Error dari jalur cepat (winspoolErr) disertakan pada pesan
+// akhir agar log /api/logs menampilkan konteks lengkap.
+func spoolWindowsFallback(ctx context.Context, printerName string, payload []byte, winspoolErr error) error {
+	tmp, err := os.CreateTemp("", "printbridge-*.bin")
+	if err != nil {
+		return fmt.Errorf("winspool: %v ; gagal membuat file temp: %w", winspoolErr, err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(payload); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("winspool: %v ; gagal menulis file temp: %w", winspoolErr, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("winspool: %v ; gagal menutup file temp: %w", winspoolErr, err)
+	}
+	defer os.Remove(tmpPath)
+
+	// Strategi 1: utilitas `print /D:` (Windows builtin).
+	if _, err2 := runCommand(ctx, 15*time.Second, "cmd", "/C", "print", "/D:"+printerName, tmpPath); err2 == nil {
 		return nil
 	} else {
-		// Strategi 2: gunakan perintah `print` (hanya untuk plain text/ESC stream sederhana).
-		_, err2 := runCommand(ctx, 15*time.Second, "cmd", "/C", "print", "/D:"+printerName, filePath)
-		if err2 == nil {
-			return nil
-		}
-		// Strategi 3: copy /B ke share lokal printer.
+		// Strategi 2: `copy /B` ke share lokal printer (\\localhost\<printer>).
 		share := `\\localhost\` + printerName
-		_, err3 := runCommand(ctx, 10*time.Second, "cmd", "/C", "copy", "/B", filePath, share)
-		if err3 == nil {
+		if _, err3 := runCommand(ctx, 10*time.Second, "cmd", "/C", "copy", "/B", tmpPath, share); err3 == nil {
 			return nil
+		} else {
+			return fmt.Errorf("winspool: %v ; print: %v ; copy: %v", winspoolErr, err2, err3)
 		}
-		return fmt.Errorf("powershell: %v ; print: %v ; copy: %v", err, err2, err3)
 	}
-}
-
-// buildPowerShellRawPrintScript menghasilkan script PowerShell yang
-// mengirim file biner ke printer Windows menggunakan WinSpool API
-// melalui type definition .NET inline. Pendekatan ini bekerja untuk
-// printer ESC/POS maupun dotmatrix tanpa perlu driver tambahan.
-func buildPowerShellRawPrintScript(printerName, filePath string) string {
-	// Escape kutip ganda agar aman di dalam string PowerShell.
-	pn := strings.ReplaceAll(printerName, `"`, `""`)
-	fp := strings.ReplaceAll(filePath, `"`, `""`)
-	// Script menggunakan Add-Type untuk mendefinisikan helper RawPrint
-	// yang memanggil winspool.drv (OpenPrinter, StartDocPrinter, dst).
-	return fmt.Sprintf(`
-$source = @"
-using System;
-using System.IO;
-using System.Runtime.InteropServices;
-public class RawPrinterHelper {
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
-    public struct DOCINFOW { public string pDocName; public string pOutputFile; public string pDataType; }
-    [DllImport("winspool.Drv", EntryPoint="OpenPrinterW", SetLastError=true, CharSet=CharSet.Unicode, ExactSpelling=true)]
-    public static extern bool OpenPrinter(string src, out IntPtr hPrinter, IntPtr pd);
-    [DllImport("winspool.Drv", EntryPoint="ClosePrinter", SetLastError=true)]
-    public static extern bool ClosePrinter(IntPtr hPrinter);
-    [DllImport("winspool.Drv", EntryPoint="StartDocPrinterW", SetLastError=true, CharSet=CharSet.Unicode)]
-    public static extern bool StartDocPrinter(IntPtr hPrinter, int level, [In] ref DOCINFOW di);
-    [DllImport("winspool.Drv", EntryPoint="EndDocPrinter", SetLastError=true)]
-    public static extern bool EndDocPrinter(IntPtr hPrinter);
-    [DllImport("winspool.Drv", EntryPoint="StartPagePrinter", SetLastError=true)]
-    public static extern bool StartPagePrinter(IntPtr hPrinter);
-    [DllImport("winspool.Drv", EntryPoint="EndPagePrinter", SetLastError=true)]
-    public static extern bool EndPagePrinter(IntPtr hPrinter);
-    [DllImport("winspool.Drv", EntryPoint="WritePrinter", SetLastError=true)]
-    public static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, int dwCount, out int dwWritten);
-    public static bool SendBytesToPrinter(string printerName, byte[] bytes) {
-        IntPtr hPrinter;
-        if (!OpenPrinter(printerName, out hPrinter, IntPtr.Zero)) return false;
-        try {
-            DOCINFOW di = new DOCINFOW();
-            di.pDocName = "PrintBridge RAW";
-            di.pDataType = "RAW";
-            if (!StartDocPrinter(hPrinter, 1, ref di)) return false;
-            try {
-                if (!StartPagePrinter(hPrinter)) return false;
-                IntPtr unmanaged = Marshal.AllocCoTaskMem(bytes.Length);
-                try {
-                    Marshal.Copy(bytes, 0, unmanaged, bytes.Length);
-                    int written = 0;
-                    if (!WritePrinter(hPrinter, unmanaged, bytes.Length, out written)) return false;
-                } finally { Marshal.FreeCoTaskMem(unmanaged); }
-                EndPagePrinter(hPrinter);
-            } finally { EndDocPrinter(hPrinter); }
-        } finally { ClosePrinter(hPrinter); }
-        return true;
-    }
-}
-"@
-Add-Type -TypeDefinition $source -Language CSharp | Out-Null
-$bytes = [System.IO.File]::ReadAllBytes("%s")
-$ok = [RawPrinterHelper]::SendBytesToPrinter("%s", $bytes)
-if (-not $ok) { throw "RawPrinterHelper.SendBytesToPrinter returned false" }
-`, fp, pn)
 }
 
 // spoolUnix mengirim file RAW ke spooler CUPS pada Linux/macOS

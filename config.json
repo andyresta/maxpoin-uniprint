@@ -1,5 +1,5 @@
 {
-  "default_printer": "Microsoft Print to PDF",
+  "default_printer": "PANDAPRINTER",
   "default_paper_width_mm": 58,
   "printer_type": "spooler",
   "printer_mode": "thermal"
