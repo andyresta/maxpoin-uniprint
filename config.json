@@ -1,6 +1,6 @@
 {
-  "default_printer": "EPSON PLQ-35",
+  "default_printer": "Microsoft Print to PDF",
   "default_paper_width_mm": 58,
   "printer_type": "spooler",
-  "printer_mode": "dotmatrix"
+  "printer_mode": "thermal"
 }
